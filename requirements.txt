@@ -1,0 +1,5 @@
+flask
+spotipy
+requests
+selenium
+beautifulsoup4
