@@ -1,4 +1,3 @@
-# Use official Python base image
 FROM python:3.11-slim
 
 # Install dependencies for Chromium + Selenium
@@ -21,10 +20,8 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-RUN apt-get update && apt-get install -y chromium chromium-driver
-
 # Copy your code
 COPY . .
 
-# Default command (replace with your script)
+# Default command
 CMD ["python", "script.py"]
