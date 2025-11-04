@@ -77,7 +77,11 @@ def get_global_driver():
         options = webdriver.ChromeOptions()
         if chrome_bin:
             options.binary_location = chrome_bin
-        options.add_argument("--headless=new")
+        # fallback to legacy headless flag if new not supported
+        try:
+            options.add_argument("--headless=new")
+        except Exception:
+            options.add_argument("--headless")
         options.add_argument("--disable-gpu")
         options.add_argument("--no-sandbox")
         options.add_argument("--disable-dev-shm-usage")
@@ -100,7 +104,10 @@ def get_global_driver():
 def close_global_driver():
     global global_driver
     if global_driver:
-        global_driver.quit()
+        try:
+            global_driver.quit()
+        except Exception:
+            pass
         global_driver = None
 
 # ==== HELPER FUNCTIONS ====
@@ -112,43 +119,36 @@ def safe_spotify_call(func, *args, **kwargs):
             time.sleep(0.3)
             return func(*args, **kwargs)
         except spotipy.exceptions.SpotifyException as e:
-            if e.http_status == 404:
-                print(f"[WARN] Spotify 404 for {func.__name__}: Resource not found")
+            if getattr(e, "http_status", None) == 404:
+                print(f"[WARN] Spotify 404 for {getattr(func,'__name__',str(func))}: Resource not found")
                 return None
-            elif e.http_status == 429:
-                retry_after = int(e.headers.get("Retry-After", 30))
-                print(f"[RATE LIMIT] Waiting {retry_after}s before retrying {func.__name__}...")
+            elif getattr(e, "http_status", None) == 429:
+                retry_after = int(getattr(e, "headers", {}).get("Retry-After", 30))
+                print(f"[RATE LIMIT] Waiting {retry_after}s before retrying {getattr(func,'__name__',str(func))}...")
                 time.sleep(retry_after + 2)
-            elif 500 <= e.http_status < 600:
-                print(f"[WARN] Spotify server error ({e.http_status}) on {func.__name__}, retrying...")
+            elif 500 <= getattr(e, "http_status", 0) < 600:
+                print(f"[WARN] Spotify server error ({getattr(e,'http_status',None)}) on {getattr(func,'__name__',str(func))}, retrying...")
                 time.sleep(2)
             else:
-                print(f"[ERROR] Spotify error ({e.http_status}) in {func.__name__}: {e}")
+                print(f"[ERROR] Spotify error ({getattr(e,'http_status',None)}) in {getattr(func,'__name__',str(func))}: {e}")
                 return None
         except Exception as e:
-            print(f"[WARN] Unexpected error in {func.__name__}: {e}")
+            print(f"[WARN] Unexpected error in {getattr(func,'__name__',str(func))}: {e}")
             time.sleep(2)
-    print(f"[FAIL] {func.__name__} failed after {retries} retries")
+    print(f"[FAIL] {getattr(func,'__name__',str(func))} failed after {retries} retries")
     return None
 
 def get_random_track_from_playlist(playlist_id, excluded_artist=None, max_followers=None, source_desc="", artists_data=None, existing_artist_ids=None):
     consecutive_invalid = 0
     for attempt in range(1, 21):
-        try:
-            playlist = safe_spotify_call(
-                sp.playlist_items,
-                playlist_id,
-                fields="items(track(name,id,artists(id,name)))"
-            )
-            if not playlist or "items" not in playlist:
-                print(f"[WARN] Playlist {playlist_id} is empty or inaccessible, skipping")
-                return None
-        except SpotifyException as e:
-            if e.http_status == 404:
-                print(f"[WARN] Playlist {playlist_id} not found or inaccessible, skipping...")
-                return None
-            else:
-                raise
+        playlist = safe_spotify_call(
+            sp.playlist_items,
+            playlist_id,
+            fields="items(track(name,id,artists(id,name)))"
+        )
+        if not playlist or "items" not in playlist:
+            print(f"[WARN] Playlist {playlist_id} is empty or inaccessible, skipping")
+            return None
 
         if not playlist["items"]:
             print(f"[WARN] Playlist {playlist_id} is empty, skipping...")
@@ -156,7 +156,7 @@ def get_random_track_from_playlist(playlist_id, excluded_artist=None, max_follow
 
         item = random.choice(playlist["items"])
         track = item.get("track")
-        if not track or "id" not in track:
+        if not track or "id" not in track or track.get("id") is None:
             print(f"[WARN] Skipping track without ID in playlist '{source_desc}'")
             continue
 
@@ -241,28 +241,22 @@ def select_track_for_artist(artist_name, artists_data, existing_artist_ids):
             continue
         seen_playlists.add(playlist_id)
 
-        try:
-            playlist_items = safe_spotify_call(
-                sp.playlist_items,
-                playlist_id,
-                limit=100,
-                offset=0,
-                fields="items(track(artists(id,name)))"
-            )
-            if not playlist_items or "items" not in playlist_items:
-                print(f"[WARN] Spotify 404 or empty playlist_items: {playlist_id}, skipping")
-                # mark artist as problematic (irretrievable artist playlist)
-                try:
-                    add_blacklisted_artist(artist_id, name=artist_name)
-                    print(f"[DB] Marked artist {artist_id} as blacklisted (irretrievable artist playlist)")
-                except Exception as _:
-                    pass
-                break
-
-        except spotipy.exceptions.SpotifyException as e:
-            print(f"[WARN] Skipping playlist {playlist_id} due to Spotify error: {e}")
-            continue
-
+        playlist_items = safe_spotify_call(
+            sp.playlist_items,
+            playlist_id,
+            limit=100,
+            offset=0,
+            fields="items(track(artists(id,name)))"
+        )
+        if not playlist_items or "items" not in playlist_items:
+            print(f"[WARN] Spotify 404 or empty playlist_items: {playlist_id}, skipping")
+            # mark artist as problematic (irretrievable artist playlist)
+            try:
+                add_blacklisted_artist(artist_id, name=artist_name)
+                print(f"[DB] Marked artist {artist_id} as blacklisted (irretrievable artist playlist)")
+            except Exception:
+                pass
+            break
 
         artist_track_count = 0
         if playlist_items and isinstance(playlist_items, dict) and "items" in playlist_items:
@@ -270,7 +264,7 @@ def select_track_for_artist(artist_name, artists_data, existing_artist_ids):
                 1
                 for item in playlist_items["items"]
                 if item.get("track")
-                and artist_name.lower() in [a["name"].lower() for a in item["track"]["artists"]]
+                and artist_name.lower() in [(a.get("name") or "").lower() for a in item["track"]["artists"] if a.get("name") is not None]
             )
 
         if artist_track_count > 5:
@@ -324,6 +318,7 @@ def select_track_for_artist(artist_name, artists_data, existing_artist_ids):
             print(f"[WARN] Playlist {playlist_id} is empty or inaccessible, marking blacklisted and skipping")
             try:
                 add_or_update_user_playlist(playlist_id, name=pl.get("name"), blacklisted=True)
+                print(f"[DB] Marked user playlist {playlist_id} as blacklisted (empty or inaccessible)")
             except Exception:
                 pass
             continue
@@ -335,10 +330,9 @@ def select_track_for_artist(artist_name, artists_data, existing_artist_ids):
                 pass
         playlist_items = playlist_data["items"]
 
-
         artist_track_count = sum(
             1 for item in playlist_items
-            if item.get("track") and artist_name.lower() in [a["name"].lower() for a in item["track"]["artists"]]
+            if item.get("track") and artist_name.lower() in [(a.get("name") or "").lower() for a in item["track"]["artists"] if a.get("name") is not None]
         )
         if artist_track_count > 10:
             continue
@@ -364,7 +358,7 @@ def select_track_for_artist(artist_name, artists_data, existing_artist_ids):
         resp = requests.get(url, params=params)
         resp.raise_for_status()
         data = resp.json()
-        similar_artists = [a["name"] for a in data.get("similarartists", {}).get("artist", [])]
+        similar_artists = [a.get("name") for a in data.get("similarartists", {}).get("artist", []) if a.get("name")]
     except Exception as e:
         print(f"[WARN] Failed fetching Last.fm similar artists for {artist_name}: {e}")
         similar_artists = []
@@ -389,10 +383,10 @@ def select_track_for_artist(artist_name, artists_data, existing_artist_ids):
              track = random.choice(top_tracks)
              is_valid, reason = validate_track(track, artists_data, existing_artist_ids, max_followers=50000)
              if is_valid:
-                 print(f"[INFO] Selected valid track '{track['name']}' by '{track['artists'][0]['name']}' from Last.fm similar artists")
+                 print(f"[INFO] Selected valid track '{track.get('name')}' by '{(track.get('artists') or [{}])[0].get('name')}' from Last.fm similar artists")
                  return track
              else:
-                 print(f"[VALIDATION] Track '{track['name']}' by '{track['artists'][0]['name']}' failed: {reason}")
+                 print(f"[VALIDATION] Track '{track.get('name')}' by '{(track.get('artists') or [{}])[0].get('name')}' failed: {reason}")
 
 
     # Step 4: Spotify similar artists
@@ -419,10 +413,10 @@ def select_track_for_artist(artist_name, artists_data, existing_artist_ids):
             track = random.choice(top_tracks)
             is_valid, reason = validate_track(track, artists_data, existing_artist_ids, max_followers=50000)
             if is_valid:
-                print(f"[INFO] Selected valid track '{track['name']}' by '{track['artists'][0]['name']}' from Spotify similar artists")
+                print(f"[INFO] Selected valid track '{track.get('name')}' by '{(track.get('artists') or [{}])[0].get('name')}' from Spotify similar artists")
                 return track
             else:
-                print(f"[VALIDATION] Track '{track['name']}' by '{track['artists'][0]['name']}' failed: {reason}")
+                print(f"[VALIDATION] Track '{track.get('name')}' by '{(track.get('artists') or [{}])[0].get('name')}' failed: {reason}")
 
 
     return None
@@ -470,31 +464,30 @@ def validate_track(track, artists_data, existing_artist_ids=None, max_followers=
         return False, "Track has no artists"
 
     artist = track["artists"][0]
-    aid = artist["id"]
-    name_lower = artist["name"].lower()
+    aid = artist.get("id")
+    name_lower = (artist.get("name") or "").lower()
 
     # 1. Blocked by artists.json
     artist_entry = artists_data.get(aid)
     if not artist_entry:
         for k, v in artists_data.items():
-            if v["name"].lower() == name_lower:
+            if (v.get("name") or "").lower() == name_lower:
                 artist_entry = v
                 break
-    if artist_entry and artist_entry.get("total_liked", 0) >= 3:
-        return False, f"Artist '{artist['name']}' blocked by artists.json (total_liked >= 3)"
+    if artist_entry and int(artist_entry.get("total_liked", 0)) >= 3:
+        return False, f"Artist '{artist.get('name')}' blocked by artists.json (total_liked >= 3)"
 
     # 2. Already in playlist
-    if existing_artist_ids and (aid in existing_artist_ids or name_lower in existing_artist_ids):
-        return False, f"Artist '{artist['name']}' already has a track in playlist"
+    if existing_artist_ids and (aid in existing_artist_ids):
+        return False, f"Artist '{artist.get('name')}' already has a track in playlist"
 
     # 3. Max followers
     if max_followers:
         full_artist = safe_spotify_call(sp.artist, aid)
-        if full_artist and full_artist["followers"]["total"] > max_followers:
-            return False, f"Artist '{artist['name']}' has {full_artist['followers']['total']} followers, exceeds max {max_followers}"
+        if full_artist and full_artist.get("followers", {}).get("total", 0) > max_followers:
+            return False, f"Artist '{artist.get('name')}' has {full_artist.get('followers', {}).get('total', 0)} followers, exceeds max {max_followers}"
 
     return True, ""
-
 
 # ---- DB helpers for artist cache (script-level) ----
 def get_db_conn():
@@ -663,7 +656,10 @@ def calculate_weights(all_artists, artist_play_map):
 
         recent_14 = sum(1 for d in scrobbles if d >= recent_14_cutoff)
         recent_60 = sum(1 for d in scrobbles if d >= recent_60_cutoff)
-        total_liked = info.get("total_liked", 0)
+        try:
+            total_liked = int(info.get("total_liked", 0) or 0)
+        except Exception:
+            total_liked = 0
 
         max_recent_14 = max(max_recent_14, recent_14)
         max_recent_60 = max(max_recent_60, recent_60)
@@ -760,12 +756,15 @@ def track_allowed_to_add(track):
         return True, ""
 
     return True, ""
-def send_playlist_update_sms(songs_added, max_songs, removed_count, playlist_id):
+def send_playlist_update_sms(songs_added, max_songs, removed_count, playlist_id, whitelist_added=0, whitelist_target=10):
     today = datetime.now(timezone.utc).strftime("%m/%d/%Y")
     playlist_link = f"https://open.spotify.com/playlist/{playlist_id}"
     
     # Determine status
-    if songs_added >= max_songs:
+    if songs_added >= max_songs and whitelist_added >= whitelist_target:
+        status_emoji = "✅"
+        status_text = "Playlist successfully updated (including whitelist)"
+    elif songs_added >= max_songs:
         status_emoji = "✅"
         status_text = "Playlist successfully updated"
     else:
@@ -774,7 +773,8 @@ def send_playlist_update_sms(songs_added, max_songs, removed_count, playlist_id)
 
     message_body = (
         f"🎵 Playlist Update Summary ({today})\n\n"
-        f"Songs added: {songs_added}/{max_songs}\n"
+        f"Enhanced Recs added: {songs_added}/{max_songs}\n"
+        f"User Recs added: {whitelist_added}/{whitelist_target}\n"
         f"Old tracks removed (>=8 days old): {removed_count}\n"
         f"{status_text} {status_emoji}\n\n"
         f"Playlist Link: {playlist_link}"
@@ -795,7 +795,65 @@ def send_playlist_update_sms(songs_added, max_songs, removed_count, playlist_id)
     except Exception as e:
         print(f"⚠️ Exception occurred while sending SMS: {e}")
 
+# ==== PAGED PLAYLIST HELPERS (improves duplicate detection) ====
+def fetch_all_playlist_items(playlist_id, page_limit=100):
+    """Return list of track objects (paged) for a playlist_id using safe_spotify_call."""
+    offset = 0
+    all_items = []
+    while True:
+        res = safe_spotify_call(
+            sp.playlist_items,
+            playlist_id,
+            fields="items(track(id,name,artists(id,name)), added_at)",
+            limit=page_limit,
+            offset=offset
+        )
+        if not res or "items" not in res or not res["items"]:
+            break
+        # keep the raw items so callers can inspect added_at etc.
+        all_items.extend([it.get("track") for it in res["items"] if it.get("track")])
+        if len(res["items"]) < page_limit:
+            break
+        offset += page_limit
+    return all_items
 
+def build_existing_artist_ids(tracks):
+    ids = set()
+    for t in tracks:
+        if not t:
+            continue
+        artists = t.get("artists") or []
+        if artists and artists[0].get("id"):
+            ids.add(artists[0].get("id"))
+    return ids
+
+def build_artist_first_map(tracks):
+    """Map artist key -> first seen track {track_id, track_name, pos} for better duplicate reporting."""
+    first_map = {}
+    for idx, t in enumerate(tracks):
+        if not t:
+            continue
+        artists = t.get("artists") or []
+        if not artists:
+            continue
+        aid = artists[0].get("id")
+        name = artists[0].get("name") or ""
+        key = _artist_key_from_track(t)
+        if key and key not in first_map:
+            first_map[key] = {"track_id": t.get("id"), "track_name": t.get("name") or "<unknown>", "pos": idx}
+    return first_map
+
+def _artist_key_from_track(t):
+    artists = t.get("artists") or []
+    if not artists:
+        return None
+    aid = artists[0].get("id")
+    if aid:
+        return f"id:{aid}"
+    name = (artists[0].get("name") or "").strip().lower()
+    if name:
+        return f"name:{name}"
+    return None
 
 # ==== MAIN COMBINED SCRIPT ====
 if __name__ == "__main__":
@@ -835,24 +893,16 @@ if __name__ == "__main__":
     songs_added = 0
     max_songs = 50
     rolled_aids = set()
-    # Fetch existing tracks in the playlist
-    existing_tracks = safe_spotify_call(
-        sp.playlist_items,
-        OUTPUT_PLAYLIST_ID,
-        fields="items(track(id, artists(id,name)))",
-        limit=100  # adjust if your playlist is bigger
-    )
-    if not existing_tracks or "items" not in existing_tracks:
+
+    # --- REPLACE single-page fetch with a full paged fetch to build accurate existing_artist_ids & first-occurrence map
+    existing_tracks = fetch_all_playlist_items(OUTPUT_PLAYLIST_ID, page_limit=100)
+    if not existing_tracks:
         existing_artist_ids = set()
         print(f"[WARN] Could not fetch existing playlist items for {OUTPUT_PLAYLIST_ID}, proceeding with empty set")
     else:
-        existing_artist_ids = {
-            t.get("track", {}).get("artists", [])[0].get("id")
-            for t in existing_tracks["items"]
-            if t.get("track") and t["track"].get("artists")
-        }
-    print(f"[INFO] Found {len(existing_artist_ids)} existing artists in playlist")
-
+        existing_artist_ids = build_existing_artist_ids(existing_tracks)
+    first_artist_map = build_artist_first_map(existing_tracks)
+    print(f"[INFO] Found {len(existing_artist_ids)} existing artists in playlist (paged)")
 
     try:
         while songs_added < max_songs and len(rolled_aids) < len(weights):
@@ -872,86 +922,148 @@ if __name__ == "__main__":
                 print(f"[INFO] No valid track found for '{artist_name}', rerolling lottery")
                 continue
 
-            if track:
-                track_id = track.get("id")
-                allowed, reason = track_allowed_to_add(track)
-                if not track_id:
-                    print(f"[WARN] Skipping invalid track with missing ID: {track}")
-                elif not allowed:
-                    print(f"[INFO] Skipping track '{track.get('name')}' - {reason}")
-                else:
-                    safe_spotify_call(sp.playlist_add_items, OUTPUT_PLAYLIST_ID, [track_id])
-                    first_artist_id = None
-                    if isinstance(track.get("artists"), list) and track["artists"]:
-                        first_artist_id = track["artists"][0].get("id")
-                    if first_artist_id:
-                        existing_artist_ids.add(first_artist_id)
-                    songs_added += 1
-                    print(f"[INFO] Added track '{track.get('name','<unknown>')}' by '{track.get('artists',[{}])[0].get('name','<unknown>')}' | Total songs added: {songs_added}/{max_songs}")
+            # Final gate: enforce DB and playlist validation AGAIN with full existing_artist_ids
+            track_id = track.get("id")
+            if not track_id:
+                print(f"[WARN] Skipping invalid track with missing ID: {track}")
+                continue
+
+            allowed_db, reason_db = track_allowed_to_add(track)
+            valid_logic, reason_logic = validate_track(track, artists_data, existing_artist_ids, max_followers=None)
+
+            # If validate fails due to existing artist in playlist, try to include reporting of first occurrence
+            if not valid_logic and "already has a track" in (reason_logic or "").lower():
+                artist_key = _artist_key_from_track(track)
+                first = first_artist_map.get(artist_key) if artist_key else None
+                if first:
+                    reason_logic = f"{reason_logic}; first occurrence: '{first['track_name']}' (pos {first['pos']})"
+
+            if not allowed_db:
+                print(f"[INFO] Skipping track '{track.get('name')}' - DB block: {reason_db}")
+                continue
+            if not valid_logic:
+                print(f"[INFO] Skipping track '{track.get('name')}' - validation block: {reason_logic}")
+                continue
+
+            # Passed final gates: add track
+            add_res = safe_spotify_call(sp.playlist_add_items, OUTPUT_PLAYLIST_ID, [track_id])
+            if add_res is None:
+                print(f"[WARN] Failed to add track '{track.get('name')}' (API error).")
+                continue
+
+            # update local caches so further validations are accurate within this run
+            first_artist_id = None
+            if isinstance(track.get("artists"), list) and track["artists"]:
+                first_artist_id = track["artists"][0].get("id")
+            if first_artist_id:
+                existing_artist_ids.add(first_artist_id)
+                # also add to first_artist_map if absent
+                artist_key = _artist_key_from_track(track)
+                if artist_key and artist_key not in first_artist_map:
+                    first_artist_map[artist_key] = {"track_id": track_id, "track_name": track.get("name") or "<unknown>", "pos": None}
+            songs_added += 1
+            print(f"[INFO] Added track '{track.get('name','<unknown>')}' by '{track.get('artists',[{}])[0].get('name','<unknown>')}' | Total songs added: {songs_added}/{max_songs}")
     finally:
         # After main rolling, attempt to add up to 10 tracks sourced from whitelisted user profiles (if we hit quota)
+        whitelist_added = 0
         try:
             if songs_added >= max_songs:
                 print("[INFO] Attempting to add up to 10 tracks from whitelisted user profiles")
                 import random as _r
-                for attempt_i in range(10):
+                attempts = 0
+                # keep trying until we add 10 whitelist tracks or exhaust attempts
+                while whitelist_added < 10 and attempts < 200:
+                    attempts += 1
                     profile_id = get_random_whitelisted_profile()
                     if not profile_id:
                         print("[INFO] No whitelisted profiles found in DB")
                         break
+
+                    print(f"[WHITELIST] Attempt {attempts} for profile: {profile_id}")
                     pls = safe_spotify_call(sp.user_playlists, profile_id, limit=50)
                     if not pls or "items" not in pls or not pls["items"]:
+                        print(f"[WHITELIST] No playlists returned for profile {profile_id} (possibly private or 404). Skipping profile.")
                         continue
+
                     candidate_pl = _r.choice(pls["items"])
                     pid = candidate_pl.get("id")
-                    if not pid or is_playlist_blacklisted(pid):
+                    pl_name = candidate_pl.get("name") or "<unknown playlist>"
+                    print(f"[WHITELIST] Selected playlist '{pl_name}' ({pid}) from profile {profile_id}")
+
+                    if not pid:
+                        print(f"[WHITELIST] Playlist id missing for selected playlist from {profile_id}, skipping.")
                         continue
-                    items = safe_spotify_call(sp.playlist_items, pid, fields="items(track(id,artists(id,name)))", limit=100)
-                    if not items or "items" not in items:
+                    if is_playlist_blacklisted(pid):
+                        print(f"[WHITELIST] Playlist {pid} is blacklisted in DB; skipping.")
+                        continue
+
+                    items = safe_spotify_call(sp.playlist_items, pid, fields="items(track(id,name,artists(id,name)))", limit=100)
+                    if not items or "items" not in items or not items["items"]:
+                        print(f"[WHITELIST] Could not fetch items for playlist '{pl_name}' ({pid}). Marking blacklisted.")
                         try:
                             mark_playlist_blacklisted(pid)
                         except Exception:
                             pass
                         continue
-                    tracks = [it.get("track") for it in items["items"] if it.get("track") and it["track"].get("id")]
+
+                    # build candidate track list with safe fields
+                    tracks = []
+                    for it in items["items"]:
+                        tr = it.get("track")
+                        if not tr or not tr.get("id"):
+                            continue
+                        # ensure artists exist
+                        artists = tr.get("artists") or []
+                        if not artists:
+                            continue
+                        tracks.append(tr)
                     if not tracks:
+                        print(f"[WHITELIST] No valid tracks found in playlist '{pl_name}' ({pid})")
                         continue
+
                     picked = _r.choice(tracks)
-                    allowed, reason = track_allowed_to_add(picked)
-                    if not allowed:
+                    track_name = picked.get("name") or "<unknown track>"
+                    artist_name = (picked.get("artists") or [{}])[0].get("name") or "<unknown artist>"
+                    print(f"[WHITELIST] Picked track '{track_name}' by '{artist_name}' from playlist '{pl_name}'")
+
+                    # Run the same DB + validation checks as for main pipeline
+                    allowed_db, reason_db = track_allowed_to_add(picked)
+                    valid_logic, reason_logic = validate_track(picked, artists_data, existing_artist_ids, max_followers=None)
+                    if not allowed_db:
+                        print(f"[WHITELIST] Skipping '{track_name}' - DB blacklist: {reason_db}")
                         continue
-                    tid = picked["id"]
-                    safe_spotify_call(sp.playlist_add_items, OUTPUT_PLAYLIST_ID, [tid])
-                    print(f"[INFO] Added whitelist-sourced track '{picked.get('name')}' from profile {profile_id}")
+                    if not valid_logic:
+                        print(f"[WHITELIST] Skipping '{track_name}' - validate logic: {reason_logic}")
+                        continue
+
+                    # Add the whitelist track
+                    add_res = safe_spotify_call(sp.playlist_add_items, OUTPUT_PLAYLIST_ID, [picked.get("id")])
+                    if add_res is None:
+                        print(f"[WHITELIST] Failed to add '{track_name}' to playlist (API error).")
+                        # don't increment whitelist_added; continue attempting
+                        continue
+
+                    whitelist_added += 1
+                    print(f"[WHITELIST] Added whitelist-sourced track '{track_name}' by '{artist_name}' from playlist '{pl_name}' [{whitelist_added}/10]")
+                    # update local existing artist cache so further checks in this run are accurate
+                    try:
+                        if isinstance(picked.get("artists"), list) and picked["artists"]:
+                            fid = picked["artists"][0].get("id")
+                            if fid:
+                                existing_artist_ids.add(fid)
+                    except Exception:
+                        pass
+                    # small sleep to be polite to Spotify API
+                    time.sleep(0.2)
         except Exception as e:
             print(f"[WARN] Error during whitelist processing: {e}")
         finally:
-            close_global_driver()
-            removed_count = remove_old_tracks_from_playlist(OUTPUT_PLAYLIST_ID, days_old=8)
-            send_playlist_update_sms(songs_added, max_songs, removed_count, OUTPUT_PLAYLIST_ID)
-
-            # Export artists table from DB to ARTISTS_FILE if DB is available
+            # cleanup & reporting
             try:
-                conn = get_db_conn()
-                if conn:
-                    try:
-                        with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
-                            cur.execute("SELECT artist_id, artist_name, total_liked FROM user_artists")
-                            rows = cur.fetchall() or []
-                            artists_out = {}
-                            for r in rows:
-                                aid = r.get("artist_id")
-                                name = r.get("artist_name") or ""
-                                total = r.get("total_liked") or 0
-                                if aid:
-                                    artists_out[aid] = {"name": name, "total_liked": total}
-                        try:
-                            with open(ARTISTS_FILE, "w", encoding="utf-8") as f:
-                                json.dump({"artists": artists_out}, f, indent=2, ensure_ascii=False)
-                            print(f"[DB->FILE] Exported {len(artists_out)} artists to {ARTISTS_FILE}")
-                        except Exception as e:
-                            print(f"[WARN] Failed to write {ARTISTS_FILE}: {e}")
-                    except Exception as e:
-                        print(f"[WARN] Failed to query user_artists for export: {e}")
-            except Exception as e:
-                print(f"[WARN] Export artists to file skipped due to DB error: {e}")
+                close_global_driver()
+            except Exception:
+                pass
+            removed_count = remove_old_tracks_from_playlist(OUTPUT_PLAYLIST_ID, days_old=8)
+            send_playlist_update_sms(songs_added, max_songs, removed_count, OUTPUT_PLAYLIST_ID, whitelist_added, 10)
+            print(f"[INFO] Run complete. Enhanced added: {songs_added}/{max_songs} | Whitelist added: {whitelist_added}/10 | Old removed: {removed_count}")
+
