@@ -6,3 +6,5 @@ cull_playlist.py
 get_random_user_playlist.py
 __pycache__/add_whitelist.cpython-312.pyc
 
+boot_script.py
+run_job.log

@@ -286,68 +286,118 @@ def select_track_for_artist(artist_name, artists_data, existing_artist_ids):
         if track:
             return track
 
-    # Step 2: User playlists via API
+    # Step 2: User playlists via API (improved & randomized)
     print(f"[INFO] No valid tracks found in artist playlists for '{artist_name}'. Trying user made playlists...")
 
-    search_res = safe_spotify_call(sp.search, artist_name, type="playlist", limit=20)
-    if not search_res or "playlists" not in search_res or not search_res["playlists"].get("items"):
-        user_playlists = []
+    # Gather a randomized candidate set of playlists (avoid repeatedly using the same top results)
+    max_checks = 10
+    checked = 0
+    search_limit = 50
+    max_search_pages = 4  # up to ~200 playlists
+
+    candidate_playlists = []
+    seen_candidate_ids = set()
+    offset = 0
+    for page in range(max_search_pages):
+        search_res = safe_spotify_call(sp.search, artist_name, type="playlist", limit=search_limit, offset=offset)
+        offset += search_limit
+        if not search_res or "playlists" not in search_res or not search_res["playlists"].get("items"):
+            break
+        for pl in search_res["playlists"]["items"]:
+            pid = pl.get("id")
+            if not pid or pid in seen_candidate_ids:
+                continue
+            seen_candidate_ids.add(pid)
+            candidate_playlists.append(pl)
+        # small pause to be polite / avoid hitting rate-limits on many pages
+        time.sleep(0.15)
+        # limit growth if we already gathered enough candidates
+        if len(candidate_playlists) >= max_checks * 6:
+            break
+
+    if not candidate_playlists:
+        print(f"[INFO] No user-playlist search results for '{artist_name}'")
     else:
-        user_playlists = search_res["playlists"]["items"]
+        random.shuffle(candidate_playlists)
+        for pl in candidate_playlists:
+            if checked >= max_checks:
+                break
+            if not pl or "id" not in pl:
+                continue
+            playlist_id = pl["id"]
 
-    for pl in user_playlists[:10]:
-        if not pl or "id" not in pl:
-            continue
-        playlist_id = pl["id"]
-        # skip playlists known to be blacklisted in DB
-        if is_playlist_blacklisted(playlist_id):
-            print(f"[INFO] Skipping user playlist {playlist_id} because it's blacklisted in DB")
-            continue
-        if playlist_id in seen_playlists:
-            continue
-        seen_playlists.add(playlist_id)
+            # skip blacklisted playlists (do not count them)
+            if is_playlist_blacklisted(playlist_id):
+                print(f"[INFO] Skipping blacklisted user playlist {playlist_id} (does not count toward {max_checks} checks)")
+                continue
+            if playlist_id in seen_playlists:
+                continue
 
-        playlist_data = safe_spotify_call(
-            sp.playlist_items, 
-            playlist_id, 
-            fields="items(track(artists(id,name)))",
-            limit=100,
-            offset=0
-        )
-        if not playlist_data or "items" not in playlist_data:
-            print(f"[WARN] Playlist {playlist_id} is empty or inaccessible, marking blacklisted and skipping")
-            try:
-                add_or_update_user_playlist(playlist_id, name=pl.get("name"), blacklisted=True)
-                print(f"[DB] Marked user playlist {playlist_id} as blacklisted (empty or inaccessible)")
-            except Exception:
-                pass
-            continue
-        else:
-            # record access to this user playlist (not blacklisted)
-            try:
-                add_or_update_user_playlist(playlist_id, name=pl.get("name"), blacklisted=False)
-            except Exception:
-                pass
-        playlist_items = playlist_data["items"]
+            # fetch playlist items and verify the artist is actually present
+            playlist_data = safe_spotify_call(
+                sp.playlist_items,
+                playlist_id,
+                fields="items(track(artists(id,name)))",
+                limit=100,
+                offset=0
+            )
+            if not playlist_data or "items" not in playlist_data:
+                print(f"[WARN] Playlist {playlist_id} is empty or inaccessible, marking blacklisted and skipping")
+                try:
+                    add_or_update_user_playlist(playlist_id, name=pl.get("name"), blacklisted=True)
+                    print(f"[DB] Marked user playlist {playlist_id} as blacklisted (empty or inaccessible)")
+                except Exception:
+                    pass
+                continue
 
-        artist_track_count = sum(
-            1 for item in playlist_items
-            if item.get("track") and artist_name.lower() in [(a.get("name") or "").lower() for a in item["track"]["artists"] if a.get("name") is not None]
-        )
-        if artist_track_count > 10:
-            continue
+            # inspect whether this playlist truly contains the artist (prefer id match)
+            playlist_items = playlist_data["items"]
+            contains_artist = False
+            for item in playlist_items:
+                tr = item.get("track") or {}
+                for a in tr.get("artists", []):
+                    if a.get("id") and a.get("id") == artist_id:
+                        contains_artist = True
+                        break
+                    if (a.get("name") or "").strip().lower() == artist_name.strip().lower():
+                        contains_artist = True
+                        break
+                if contains_artist:
+                    break
 
-        track = get_random_track_from_playlist(
-            playlist_id,
-            excluded_artist=artist_name,
-            max_followers=50000,
-            source_desc=f"{pl['name']} (user-made playlist via API)",
-            artists_data=artists_data,
-            existing_artist_ids=existing_artist_ids
-        )
+            if not contains_artist:
+                # playlist doesn't actually contain the artist; skip and do NOT increment checked
+                print(f"[INFO] Playlist {playlist_id} does not contain artist '{artist_name}' — skipping (does not count toward {max_checks})")
+                seen_playlists.add(playlist_id)
+                try:
+                    add_or_update_user_playlist(playlist_id, name=pl.get("name"), blacklisted=False)
+                except Exception:
+                    pass
+                continue
 
-        if track:
-            return track
+            # playlist confirmed to contain the artist; count as inspected
+            seen_playlists.add(playlist_id)
+            checked += 1
+
+            # filter playlists overly dominated by the artist
+            artist_track_count = sum(
+                1 for item in playlist_items
+                if item.get("track") and artist_name.lower() in [(a.get("name") or "").lower() for a in item["track"]["artists"] if a.get("name") is not None]
+            )
+            if artist_track_count > 10:
+                continue
+
+            track = get_random_track_from_playlist(
+                playlist_id,
+                excluded_artist=artist_name,
+                max_followers=50000,
+                source_desc=f"{pl.get('name','<unknown>')} (user-made playlist via API)",
+                artists_data=artists_data,
+                existing_artist_ids=existing_artist_ids
+            )
+
+            if track:
+                return track
 
     # Step 3: Last.fm similar artists
     print(f"[INFO] No valid tracks found in scraped/user playlists for '{artist_name}'. Trying Last.fm similar artists...")
@@ -388,12 +438,28 @@ def select_track_for_artist(artist_name, artists_data, existing_artist_ids):
              else:
                  print(f"[VALIDATION] Track '{track.get('name')}' by '{(track.get('artists') or [{}])[0].get('name')}' failed: {reason}")
 
-
-    # Step 4: Spotify similar artists
+    # Step 4: Spotify similar artists (improved)
     print(f"[INFO] No valid tracks found via Last.fm for '{artist_name}'. Trying Spotify similar artists...")
     similar_artists_data = safe_spotify_call(sp.artist_related_artists, artist_id)
+    if not similar_artists_data or "artists" not in similar_artists_data or not similar_artists_data["artists"]:
+        # try to re-resolve artist id via broader search (attempt to handle ambiguous/missed artist ids)
+        print(f"[WARN] Spotify returned no related artists for {artist_name} ({artist_id}). Attempting broader artist lookup and retry.")
+        alt_search = safe_spotify_call(sp.search, artist_name, type="artist", limit=10)
+        if alt_search and "artists" in alt_search and alt_search["artists"].get("items"):
+            # try to pick the best matching artist by exact name match first
+            candidates = alt_search["artists"]["items"]
+            best = None
+            for c in candidates:
+                if (c.get("name") or "").strip().lower() == artist_name.strip().lower():
+                    best = c
+                    break
+            if not best:
+                best = candidates[0]
+            if best and best.get("id") and best.get("id") != artist_id:
+                similar_artists_data = safe_spotify_call(sp.artist_related_artists, best["id"])
+
     if not similar_artists_data or "artists" not in similar_artists_data:
-        print(f"[WARN] Spotify 404 for artist_related_artists: {artist_id}")
+        print(f"[WARN] Spotify related-artists not available for '{artist_name}'. Skipping Spotify-similar step.")
         return None 
 
     artists_list = similar_artists_data["artists"]
@@ -417,7 +483,6 @@ def select_track_for_artist(artist_name, artists_data, existing_artist_ids):
                 return track
             else:
                 print(f"[VALIDATION] Track '{track.get('name')}' by '{(track.get('artists') or [{}])[0].get('name')}' failed: {reason}")
-
 
     return None
 
@@ -852,6 +917,151 @@ def fetch_all_playlist_items(playlist_id, page_limit=100):
         offset += page_limit
     return all_items
 
+# ...existing code...
+
+def add_track_to_blacklist_db(track):
+    """
+    Insert a track into blacklisted_songs with fixed = false.
+    Attempts insertion with created_at column if present, otherwise falls back.
+    """
+    if not track or not isinstance(track, dict):
+        return
+    tid = track.get("id")
+    if not tid:
+        return
+    song_name = track.get("name") or ""
+    artists = track.get("artists") or []
+    artist_id = artists[0].get("id") if artists and artists[0].get("id") else None
+    artist_name = artists[0].get("name") if artists and artists[0].get("name") else None
+
+    conn = get_db_conn()
+    if not conn:
+        print("[DB] No DB connection available to insert blacklisted song")
+        return
+    try:
+        with conn.cursor() as cur:
+            try:
+                cur.execute(
+                    """
+                    INSERT INTO blacklisted_songs (song_id, song_name, artist_id, artist_name, fixed, created_at)
+                    VALUES (%s, %s, %s, %s, false, NOW())
+                    ON CONFLICT (song_id) DO NOTHING
+                    """,
+                    (tid, song_name, artist_id, artist_name),
+                )
+            except Exception:
+                # fallback if created_at doesn't exist
+                try:
+                    cur.execute(
+                        """
+                        INSERT INTO blacklisted_songs (song_id, song_name, artist_id, artist_name, fixed)
+                        VALUES (%s, %s, %s, %s, false)
+                        ON CONFLICT (song_id) DO NOTHING
+                        """,
+                        (tid, song_name, artist_id, artist_name),
+                    )
+                except Exception as e2:
+                    print(f"[DB] Failed to insert blacklisted song (fallback): {e2}")
+    except Exception as e:
+        print(f"[DB] Failed to insert blacklisted song: {e}")
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+def cleanup_old_blacklisted_songs(playlist_id, days=14):
+    """
+    Remove tracks from the playlist that are in blacklisted_songs with fixed = false
+    and older than `days`. After removal, mark them fixed = true.
+    Returns number of tracks removed.
+    """
+    conn = get_db_conn()
+    if not conn:
+        print("[DB] No DB connection available for cleanup_old_blacklisted_songs")
+        return 0
+    try:
+        with conn.cursor() as cur:
+            # try to select using created_at if available
+            try:
+                cur.execute(
+                    """
+                    SELECT song_id FROM blacklisted_songs
+                    WHERE fixed = false AND created_at <= (NOW() - INTERVAL %s)
+                    """,
+                    (f"{days} days",),
+                )
+            except Exception as e:
+                # created_at might not exist, fallback: select all fixed=false (can't filter by age)
+                print(f"[DB] cleanup query with created_at failed: {e}; attempting fallback select of all fixed=false")
+                try:
+                    cur.execute(
+                        "SELECT song_id, created_at FROM blacklisted_songs WHERE fixed = false"
+                    )
+                    rows = cur.fetchall()
+                    # if created_at not available, don't remove anything conservatively
+                    # try to filter by created_at if present in row
+                    song_ids = []
+                    now = datetime.now(timezone.utc)
+                    for r in rows:
+                        sid = r[0]
+                        created = None
+                        if len(r) > 1 and isinstance(r[1], datetime):
+                            created = r[1]
+                        if created:
+                            age_days = (now - created).days
+                            if age_days >= days:
+                                song_ids.append(sid)
+                    if not song_ids:
+                        print("[DB] No qualifying old blacklisted songs found in fallback")
+                        return 0
+                except Exception as e2:
+                    print(f"[DB] Fallback cleanup query failed: {e2}")
+                    return 0
+            else:
+                rows = cur.fetchall()
+                song_ids = [r[0] for r in rows if r and r[0]]
+            if not song_ids:
+                print("[DB] No old blacklisted songs to remove")
+                return 0
+
+            # build URIs and remove in batches
+            uris = [f"spotify:track:{sid}" for sid in sorted(set(song_ids))]
+            removed_total = 0
+            batch_size = 50
+            for i in range(0, len(uris), batch_size):
+                batch = uris[i : i + batch_size]
+                res = safe_spotify_call(sp.playlist_remove_all_occurrences_of_items, playlist_id, batch)
+                if res is None:
+                    print(f"[WARN] Removal batch failed for {len(batch)} URIs during blacklist cleanup")
+                else:
+                    removed_total += len(batch)
+                    print(f"[INFO] Removed {len(batch)} blacklisted URIs from playlist {playlist_id}")
+
+            if removed_total > 0:
+                # mark removed song_ids as fixed = true
+                try:
+                    cur.execute(
+                        """
+                        UPDATE blacklisted_songs SET fixed = true
+                        WHERE song_id = ANY(%s)
+                        """,
+                        (list(set(song_ids)),),
+                    )
+                    print(f"[DB] Marked {len(set(song_ids))} blacklisted_songs.fixed = true")
+                except Exception as e:
+                    print(f"[DB] Failed to mark blacklisted_songs fixed: {e}")
+
+            return removed_total
+    except Exception as e:
+        print(f"[DB] Error during cleanup_old_blacklisted_songs: {e}")
+        return 0
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
 def build_existing_artist_ids(tracks):
     ids = set()
     for t in tracks:
@@ -920,6 +1130,9 @@ if __name__ == "__main__":
         else:
             all_artists[aid] = {"name": new_name, "total_liked": new_total}
 
+    # Ensure validation uses the merged view (DB + newly scanned liked songs)
+    artists_data = dict(all_artists)
+
     recent_tracks = fetch_all_recent_tracks()
     artist_play_map = build_artist_play_map(recent_tracks)
 
@@ -985,6 +1198,13 @@ if __name__ == "__main__":
             if add_res is None:
                 print(f"[WARN] Failed to add track '{track.get('name')}' (API error).")
                 continue
+
+            # insert into blacklisted_songs (fixed = false) so this track is ineligible on future runs
+            try:
+                add_track_to_blacklist_db(track)
+                print(f"[DB] Inserted added track '{track.get('name')}' ({track_id}) into blacklisted_songs (fixed=false)")
+            except Exception as e:
+                print(f"[DB] Failed to insert added track into blacklisted_songs: {e}")
 
             # update local caches so further validations are accurate within this run
             first_artist_id = None
@@ -1078,6 +1298,13 @@ if __name__ == "__main__":
                         # don't increment whitelist_added; continue attempting
                         continue
 
+                    # insert whitelist-added track into blacklisted_songs (fixed = false)
+                    try:
+                        add_track_to_blacklist_db(picked)
+                        print(f"[DB] Inserted whitelist track '{track_name}' ({picked.get('id')}) into blacklisted_songs (fixed=false)")
+                    except Exception as e:
+                        print(f"[DB] Failed to insert whitelist track into blacklisted_songs: {e}")
+
                     whitelist_added += 1
                     print(f"[WHITELIST] Added whitelist-sourced track '{track_name}' by '{artist_name}' from playlist '{pl_name}' [{whitelist_added}/10]")
                     # update local existing artist cache so further checks in this run are accurate
@@ -1099,6 +1326,9 @@ if __name__ == "__main__":
             except Exception:
                 pass
             removed_count = remove_old_tracks_from_playlist(OUTPUT_PLAYLIST_ID, days_old=8)
+            # remove any blacklisted_songs older than 14 days with fixed=false
+            added_removed = cleanup_old_blacklisted_songs(OUTPUT_PLAYLIST_ID, days=14)
+            removed_count += added_removed
             send_playlist_update_sms(songs_added, max_songs, removed_count, OUTPUT_PLAYLIST_ID, whitelist_added, 10)
             print(f"[INFO] Run complete. Enhanced added: {songs_added}/{max_songs} | Whitelist added: {whitelist_added}/10 | Old removed: {removed_count}")
 
