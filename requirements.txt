@@ -1,5 +1,8 @@
-flask
 spotipy
 requests
 selenium
 beautifulsoup4
+lxml
+psycopg2-binary
+chromedriver-binary
+python-dotenv
