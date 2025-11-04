@@ -19,6 +19,23 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from bs4 import BeautifulSoup
 
+import psycopg2
+import psycopg2.extras
+from urllib.parse import urlparse
+
+# add DB helpers import (new file db_helpers.py)
+from db_helpers import (
+    is_artist_blacklisted,
+    add_blacklisted_artist,
+    is_playlist_blacklisted,
+    add_or_update_user_playlist,
+    mark_playlist_blacklisted,
+    is_track_blacklisted,
+    blacklisted_artist_count,
+    add_blacklisted_song,
+    get_random_whitelisted_profile,
+)
+
 # ==== CONFIG ====
 ARTISTS_FILE = "artists.json"
 OUTPUT_PLAYLIST_ID = os.environ.get("PLAYLIST_ID")  # Spotify playlist to add tracks
@@ -76,23 +93,31 @@ def close_global_driver():
 
 # ==== HELPER FUNCTIONS ====
 def safe_spotify_call(func, *args, **kwargs):
-    time.sleep(.5)
-    try:
-        return func(*args, **kwargs)
-    except spotipy.exceptions.SpotifyException as e:
-        # Common transient or not-found cases
-        if e.http_status == 404:
-            print(f"[WARN] Spotify 404 for {func.__name__}: Resource not found")
-        elif e.http_status == 429:
-            print(f"[WARN] Rate limited in {func.__name__}; sleeping...")
-            time.sleep(120)
-        else:
-            print(f"[WARN] Spotify error in {func.__name__}: {e}")
-        return None
-    except Exception as e:
-        print(f"[WARN] Unexpected error in {func.__name__}: {e}")
-        return None
-
+    """Spotify call wrapper with retries, 404 skip, and None fallback."""
+    retries = 3
+    for attempt in range(retries):
+        try:
+            time.sleep(0.3)
+            return func(*args, **kwargs)
+        except spotipy.exceptions.SpotifyException as e:
+            if e.http_status == 404:
+                print(f"[WARN] Spotify 404 for {func.__name__}: Resource not found")
+                return None
+            elif e.http_status == 429:
+                retry_after = int(e.headers.get("Retry-After", 30))
+                print(f"[RATE LIMIT] Waiting {retry_after}s before retrying {func.__name__}...")
+                time.sleep(retry_after + 2)
+            elif 500 <= e.http_status < 600:
+                print(f"[WARN] Spotify server error ({e.http_status}) on {func.__name__}, retrying...")
+                time.sleep(2)
+            else:
+                print(f"[ERROR] Spotify error ({e.http_status}) in {func.__name__}: {e}")
+                return None
+        except Exception as e:
+            print(f"[WARN] Unexpected error in {func.__name__}: {e}")
+            time.sleep(2)
+    print(f"[FAIL] {func.__name__} failed after {retries} retries")
+    return None
 
 def get_random_track_from_playlist(playlist_id, excluded_artist=None, max_followers=None, source_desc="", artists_data=None, existing_artist_ids=None):
     consecutive_invalid = 0
@@ -183,14 +208,21 @@ def select_track_for_artist(artist_name, artists_data, existing_artist_ids):
     seen_playlists = set()
     playlist_attempts = 0
 
-    artist_results = safe_spotify_call(sp.search, artist_name, type="artist", limit=1)["artists"]["items"]
-    if not artist_results:
+    # defensive: check search result before indexing
+    search_res = safe_spotify_call(sp.search, artist_name, type="artist", limit=1)
+    if not search_res or "artists" not in search_res or not search_res["artists"].get("items"):
         print(f"[WARN] No Spotify artist found for '{artist_name}'")
         return None
+    artist_results = search_res["artists"]["items"]
     artist_id = artist_results[0]["id"]
 
-    # Step 1: Scraped artist playlists
-    scraped_artist_playlists = scrape_artist_playlists(artist_id)
+    # If artist is in blacklisted_artists_playlists, skip scraping step
+    if is_artist_blacklisted(artist_id):
+        print(f"[INFO] Artist {artist_name} ({artist_id}) is blacklisted for artist playlists; skipping Step 1")
+        scraped_artist_playlists = []
+    else:
+        # Step 1: Scraped artist playlists
+        scraped_artist_playlists = scrape_artist_playlists(artist_id)
     for pl in scraped_artist_playlists:
         playlist_id = pl["url"].split("/")[-1].split("?")[0]
         if playlist_id in seen_playlists:
@@ -203,13 +235,17 @@ def select_track_for_artist(artist_name, artists_data, existing_artist_ids):
                 playlist_id,
                 limit=100,
                 offset=0,
-                fields="items(track(artists(id,name)))",
-                market=None,
-                additional_types="track,episode"
+                fields="items(track(artists(id,name)))"
             )
             if not playlist_items or "items" not in playlist_items:
-                print(f"[WARN] Spotify 404 for playlist_items: {playlist_id}, skipping")
-                continue
+                print(f"[WARN] Spotify 404 or empty playlist_items: {playlist_id}, skipping")
+                # mark artist as problematic (irretrievable artist playlist)
+                try:
+                    add_blacklisted_artist(artist_id, name=artist_name)
+                    print(f"[DB] Marked artist {artist_id} as blacklisted (irretrievable artist playlist)")
+                except Exception as _:
+                    pass
+                break
 
         except spotipy.exceptions.SpotifyException as e:
             print(f"[WARN] Skipping playlist {playlist_id} due to Spotify error: {e}")
@@ -247,11 +283,20 @@ def select_track_for_artist(artist_name, artists_data, existing_artist_ids):
     # Step 2: User playlists via API
     print(f"[INFO] No valid tracks found in artist playlists for '{artist_name}'. Trying user made playlists...")
 
-    user_playlists = safe_spotify_call(sp.search, artist_name, type="playlist", limit=20)["playlists"]["items"]
+    search_res = safe_spotify_call(sp.search, artist_name, type="playlist", limit=20)
+    if not search_res or "playlists" not in search_res or not search_res["playlists"].get("items"):
+        user_playlists = []
+    else:
+        user_playlists = search_res["playlists"]["items"]
+
     for pl in user_playlists[:10]:
         if not pl or "id" not in pl:
             continue
         playlist_id = pl["id"]
+        # skip playlists known to be blacklisted in DB
+        if is_playlist_blacklisted(playlist_id):
+            print(f"[INFO] Skipping user playlist {playlist_id} because it's blacklisted in DB")
+            continue
         if playlist_id in seen_playlists:
             continue
         seen_playlists.add(playlist_id)
@@ -259,11 +304,23 @@ def select_track_for_artist(artist_name, artists_data, existing_artist_ids):
         playlist_data = safe_spotify_call(
             sp.playlist_items, 
             playlist_id, 
-            fields="items(track(artists(id,name)))"
+            fields="items(track(artists(id,name)))",
+            limit=100,
+            offset=0
         )
         if not playlist_data or "items" not in playlist_data:
-            print(f"[WARN] Playlist {playlist_id} is empty or inaccessible, skipping")
+            print(f"[WARN] Playlist {playlist_id} is empty or inaccessible, marking blacklisted and skipping")
+            try:
+                add_or_update_user_playlist(playlist_id, name=pl.get("name"), blacklisted=True)
+            except Exception:
+                pass
             continue
+        else:
+            # record access to this user playlist (not blacklisted)
+            try:
+                add_or_update_user_playlist(playlist_id, name=pl.get("name"), blacklisted=False)
+            except Exception:
+                pass
         playlist_items = playlist_data["items"]
 
 
@@ -414,13 +471,70 @@ def validate_track(track, artists_data, existing_artist_ids=None, max_followers=
     return True, ""
 
 
-# ==== UPDATE ARTISTS CACHE ====
+# ---- DB helpers for artist cache (script-level) ----
+def get_db_conn():
+    db_url = os.environ.get("DATABASE_URL")
+    if not db_url:
+        print("[DB] DATABASE_URL not set; DB operations disabled for artist cache")
+        return None
+    try:
+        conn = psycopg2.connect(db_url)
+        conn.autocommit = True
+        return conn
+    except Exception as e:
+        print(f"[DB] Failed to connect to DB for artist cache: {e}")
+        return None
+
+def load_artists_from_db():
+    """
+    Load artist cache from user_artists table (artist_id -> {name, total_liked})
+    Falls back to reading ARTISTS_FILE if DB is unavailable.
+    """
+    conn = get_db_conn()
+    if not conn:
+        # fallback to file if present
+        if os.path.exists(ARTISTS_FILE):
+            try:
+                with open(ARTISTS_FILE, "r") as f:
+                    return json.load(f).get("artists", {})
+            except Exception as e:
+                print(f"[WARN] Failed to load {ARTISTS_FILE}: {e}")
+                return {}
+        return {}
+
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
+            cur.execute("SELECT artist_id, artist_name, total_liked FROM user_artists")
+            rows = cur.fetchall()
+            artists = {}
+            for r in rows:
+                aid = r.get("artist_id")
+                name = r.get("artist_name") or ""
+                total = r.get("total_liked") or 0
+                if aid:
+                    artists[aid] = {"name": name, "total_liked": total}
+            return artists
+    except Exception as e:
+        print(f"[DB] Failed to query user_artists: {e}")
+        # fallback to file
+        if os.path.exists(ARTISTS_FILE):
+            try:
+                with open(ARTISTS_FILE, "r") as f:
+                    return json.load(f).get("artists", {})
+            except Exception:
+                pass
+        return {}
+
 def update_artists_from_likes():
     print("[INFO] Starting to update liked artist cache")
     
+    # load existing cache only for informational purposes (we won't overwrite DB here)
     if os.path.exists(ARTISTS_FILE):
-        with open(ARTISTS_FILE, "r") as f:
-            artist_cache = json.load(f).get("artists", {})
+        try:
+            with open(ARTISTS_FILE, "r") as f:
+                artist_cache = json.load(f).get("artists", {})
+        except Exception:
+            artist_cache = {}
     else:
         artist_cache = {}
 
@@ -444,6 +558,9 @@ def update_artists_from_likes():
             batch_limit = min(batch_limit, remaining)
 
         results = safe_spotify_call(sp.current_user_saved_tracks, limit=batch_limit, offset=offset)
+        if not results or "items" not in results:
+            print("[INFO] No more liked tracks returned from Spotify or call failed")
+            break
         items = results["items"]
         if not items:
             print("[INFO] No more liked tracks returned from Spotify")
@@ -453,18 +570,29 @@ def update_artists_from_likes():
         existing_artists_in_batch = 0
 
         for item in items:
-            track = item["track"]
-            added_at = datetime.strptime(item["added_at"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
-            all_liked_songs.append({"track_id": track["id"], "artists": track["artists"], "added_at": added_at})
+            track = item.get("track")
+            if not track:
+                continue
+            added_at_str = item.get("added_at")
+            try:
+                added_at = datetime.strptime(added_at_str, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc) if added_at_str else None
+            except Exception:
+                added_at = None
 
-            for artist in track["artists"]:
-                aid = artist["id"]
-            if aid not in artist_cache:
-                artist_cache[aid] = {"name": artist["name"], "total_liked": 1}
-                new_artists[aid] = {"name": artist["name"], "total_liked": 1}
-            else:
-                artist_cache[aid]["total_liked"] += 1
+            all_liked_songs.append({"track_id": track.get("id"), "artists": track.get("artists", []), "added_at": added_at})
 
+            # process each artist on the track
+            for artist in track.get("artists", []):
+                aid = artist.get("id")
+                if not aid:
+                    continue
+                if aid not in artist_cache:
+                    artist_cache[aid] = {"name": artist.get("name", ""), "total_liked": 1}
+                    new_artists[aid] = {"name": artist.get("name", ""), "total_liked": 1}
+                    new_artists_in_batch += 1
+                else:
+                    artist_cache[aid]["total_liked"] = artist_cache[aid].get("total_liked", 0) + 1
+                    existing_artists_in_batch += 1
 
             total_processed += 1
 
@@ -480,11 +608,9 @@ def update_artists_from_likes():
             print(f"[INFO] Reached the scan limit of {scan_limit} tracks after batch {batch_number-1}")
             break
 
-    with open(ARTISTS_FILE, "w") as f:
-        json.dump({"artists": artist_cache}, f, indent=2)
-
-    print(f"[INFO] Finished updating liked artist cache: {len(artist_cache)} total artists cached, "
-          f"{len(new_artists)} new artists added in this run")
+    # Do NOT overwrite ARTISTS_FILE here. Persisting to DB is optional and depends on schema.
+    # Return newly discovered artists (caller will merge with DB-sourced artists).
+    print(f"[INFO] Finished scanning liked tracks: {len(new_artists)} new artists discovered in this run")
     
     return new_artists, all_liked_songs
 
@@ -531,15 +657,27 @@ def remove_old_tracks_from_playlist(playlist_id, days_old=8):
         limit=100  # adjust if your playlist is bigger
     )
 
+    if not existing_tracks or "items" not in existing_tracks:
+        print(f"[WARN] Could not fetch existing tracks for playlist {playlist_id}")
+        return 0
+
     now = datetime.now(timezone.utc)
     tracks_to_remove = []
 
     for item in existing_tracks["items"]:
-        track = item["track"]
-        added_at = datetime.strptime(item["added_at"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+        track = item.get("track")
+        added_at_str = item.get("added_at")
+        if not track or not added_at_str:
+            continue
+        try:
+            added_at = datetime.strptime(added_at_str, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+        except Exception:
+            continue
         age_days = (now - added_at).days
         if age_days >= days_old:
-            tracks_to_remove.append({"uri": track["id"]})
+            track_id = track.get("id")
+            if track_id:
+                tracks_to_remove.append({"uri": f"spotify:track:{track_id}"})
 
     removed_count = 0
     if tracks_to_remove:
@@ -551,6 +689,45 @@ def remove_old_tracks_from_playlist(playlist_id, days_old=8):
 
     return removed_count
 
+# add track_allowed_to_add helper to check DB blacklists before adding a track
+def track_allowed_to_add(track):
+    """
+    Returns (True, "") if the track may be added.
+    Returns (False, reason) if the track should be skipped.
+    Checks:
+      - track has an id and artists
+      - song is not present in blacklisted_songs
+      - artist does not appear >= 3 times in blacklisted_songs
+    DB errors are logged and treated conservatively (allow).
+    """
+    if not track or not isinstance(track, dict):
+        return False, "Invalid track payload"
+    tid = track.get("id")
+    if not tid:
+        return False, "Missing track id"
+
+    try:
+        # exact track blacklist
+        if is_track_blacklisted(tid):
+            return False, "Track is blacklisted"
+
+        # artist-level blacklist count
+        artists = track.get("artists") or []
+        if artists:
+            artist_id = artists[0].get("id")
+            if artist_id:
+                try:
+                    cnt = blacklisted_artist_count(artist_id) or 0
+                except Exception:
+                    cnt = 0
+                if cnt >= 3:
+                    return False, f"Artist has {cnt} entries in blacklisted_songs"
+    except Exception as e:
+        # If DB checks fail, log and allow (avoid blocking due to transient DB issues)
+        print(f"[WARN] track_allowed_to_add DB check failed: {e}")
+        return True, ""
+
+    return True, ""
 def send_playlist_update_sms(songs_added, max_songs, removed_count, playlist_id):
     today = datetime.now(timezone.utc).strftime("%m/%d/%Y")
     playlist_link = f"https://open.spotify.com/playlist/{playlist_id}"
@@ -592,11 +769,21 @@ def send_playlist_update_sms(songs_added, max_songs, removed_count, playlist_id)
 if __name__ == "__main__":
     print("Starting Enhanced Recs Script...")
     time.sleep(1)
-    # Update artists cache
+    # Update artists cache (scan user's liked songs for new artists)
     new_artists, _ = update_artists_from_likes()
-    with open(ARTISTS_FILE, "r") as f:
-        artists_data = json.load(f)["artists"]
-    all_artists = {**artists_data, **new_artists}
+
+    # Load canonical artist cache from DB (fallback to file if DB absent)
+    artists_data = load_artists_from_db()
+
+    # Merge DB-cache with newly discovered artists (new_artists may include names/total_liked increments)
+    all_artists = {**artists_data}
+    for aid, info in new_artists.items():
+        if aid in all_artists:
+            all_artists[aid]["total_liked"] = max(all_artists[aid].get("total_liked", 0), info.get("total_liked", 0))
+            if not all_artists[aid].get("name"):
+                all_artists[aid]["name"] = info.get("name")
+        else:
+            all_artists[aid] = info
 
     recent_tracks = fetch_all_recent_tracks()
     artist_play_map = build_artist_play_map(recent_tracks)
@@ -613,7 +800,15 @@ if __name__ == "__main__":
         fields="items(track(id, artists(id,name)))",
         limit=100  # adjust if your playlist is bigger
     )
-    existing_artist_ids = {t["track"]["artists"][0]["id"] for t in existing_tracks["items"]}
+    if not existing_tracks or "items" not in existing_tracks:
+        existing_artist_ids = set()
+        print(f"[WARN] Could not fetch existing playlist items for {OUTPUT_PLAYLIST_ID}, proceeding with empty set")
+    else:
+        existing_artist_ids = {
+            t.get("track", {}).get("artists", [])[0].get("id")
+            for t in existing_tracks["items"]
+            if t.get("track") and t["track"].get("artists")
+        }
     print(f"[INFO] Found {len(existing_artist_ids)} existing artists in playlist")
 
 
@@ -635,13 +830,86 @@ if __name__ == "__main__":
                 print(f"[INFO] No valid track found for '{artist_name}', rerolling lottery")
                 continue
 
-            
             if track:
-                sp.playlist_add_items(OUTPUT_PLAYLIST_ID, [track["id"]])
-                existing_artist_ids.add(track["artists"][0]["id"])
-                songs_added += 1
-                print(f"[INFO] Added track '{track['name']}' by '{track['artists'][0]['name']}' | Total songs added: {songs_added}/{max_songs}")
+                track_id = track.get("id")
+                allowed, reason = track_allowed_to_add(track)
+                if not track_id:
+                    print(f"[WARN] Skipping invalid track with missing ID: {track}")
+                elif not allowed:
+                    print(f"[INFO] Skipping track '{track.get('name')}' - {reason}")
+                else:
+                    safe_spotify_call(sp.playlist_add_items, OUTPUT_PLAYLIST_ID, [track_id])
+                    first_artist_id = None
+                    if isinstance(track.get("artists"), list) and track["artists"]:
+                        first_artist_id = track["artists"][0].get("id")
+                    if first_artist_id:
+                        existing_artist_ids.add(first_artist_id)
+                    songs_added += 1
+                    print(f"[INFO] Added track '{track.get('name','<unknown>')}' by '{track.get('artists',[{}])[0].get('name','<unknown>')}' | Total songs added: {songs_added}/{max_songs}")
     finally:
-        close_global_driver()
-        removed_count = remove_old_tracks_from_playlist(OUTPUT_PLAYLIST_ID, days_old=8)
-        send_playlist_update_sms(songs_added, max_songs, removed_count, OUTPUT_PLAYLIST_ID)
+        # After main rolling, attempt to add up to 10 tracks sourced from whitelisted user profiles (if we hit quota)
+        try:
+            if songs_added >= max_songs:
+                print("[INFO] Attempting to add up to 10 tracks from whitelisted user profiles")
+                import random as _r
+                for attempt_i in range(10):
+                    profile_id = get_random_whitelisted_profile()
+                    if not profile_id:
+                        print("[INFO] No whitelisted profiles found in DB")
+                        break
+                    pls = safe_spotify_call(sp.user_playlists, profile_id, limit=50)
+                    if not pls or "items" not in pls or not pls["items"]:
+                        continue
+                    candidate_pl = _r.choice(pls["items"])
+                    pid = candidate_pl.get("id")
+                    if not pid or is_playlist_blacklisted(pid):
+                        continue
+                    items = safe_spotify_call(sp.playlist_items, pid, fields="items(track(id,artists(id,name)))", limit=100)
+                    if not items or "items" not in items:
+                        try:
+                            mark_playlist_blacklisted(pid)
+                        except Exception:
+                            pass
+                        continue
+                    tracks = [it.get("track") for it in items["items"] if it.get("track") and it["track"].get("id")]
+                    if not tracks:
+                        continue
+                    picked = _r.choice(tracks)
+                    allowed, reason = track_allowed_to_add(picked)
+                    if not allowed:
+                        continue
+                    tid = picked["id"]
+                    safe_spotify_call(sp.playlist_add_items, OUTPUT_PLAYLIST_ID, [tid])
+                    print(f"[INFO] Added whitelist-sourced track '{picked.get('name')}' from profile {profile_id}")
+        except Exception as e:
+            print(f"[WARN] Error during whitelist processing: {e}")
+        finally:
+            close_global_driver()
+            removed_count = remove_old_tracks_from_playlist(OUTPUT_PLAYLIST_ID, days_old=8)
+            send_playlist_update_sms(songs_added, max_songs, removed_count, OUTPUT_PLAYLIST_ID)
+
+            # Export artists table from DB to ARTISTS_FILE if DB is available
+            try:
+                conn = get_db_conn()
+                if conn:
+                    try:
+                        with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
+                            cur.execute("SELECT artist_id, artist_name, total_liked FROM user_artists")
+                            rows = cur.fetchall() or []
+                            artists_out = {}
+                            for r in rows:
+                                aid = r.get("artist_id")
+                                name = r.get("artist_name") or ""
+                                total = r.get("total_liked") or 0
+                                if aid:
+                                    artists_out[aid] = {"name": name, "total_liked": total}
+                        try:
+                            with open(ARTISTS_FILE, "w", encoding="utf-8") as f:
+                                json.dump({"artists": artists_out}, f, indent=2, ensure_ascii=False)
+                            print(f"[DB->FILE] Exported {len(artists_out)} artists to {ARTISTS_FILE}")
+                        except Exception as e:
+                            print(f"[WARN] Failed to write {ARTISTS_FILE}: {e}")
+                    except Exception as e:
+                        print(f"[WARN] Failed to query user_artists for export: {e}")
+            except Exception as e:
+                print(f"[WARN] Export artists to file skipped due to DB error: {e}")
