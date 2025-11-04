@@ -677,45 +677,80 @@ def calculate_weights(all_artists, artist_play_map):
     return weights
 
 def remove_old_tracks_from_playlist(playlist_id, days_old=8):
-    print(f"[INFO] Checking for tracks older than {days_old} days in playlist {playlist_id}...")
-    existing_tracks = safe_spotify_call(
-        sp.playlist_items,
-        playlist_id,
-        fields="items(track(id,name,artists(id,name)), added_at)",
-        limit=100  # adjust if your playlist is bigger
-    )
+    """
+    Scan the entire playlist (paged) and remove any track whose added_at is
+    >= days_old. Uses safe_spotify_call and removes in batches.
+    Note: spotify.playlist_remove_all_occurrences_of_items removes all occurrences
+    of the provided track URIs in the playlist.
+    """
+    print(f"[INFO] Scanning entire playlist for tracks older than {days_old} days: {playlist_id}")
+    limit = 100
+    offset = 0
+    now = datetime.now(timezone.utc)
+    uris_to_remove = []
+    while True:
+        res = safe_spotify_call(
+            sp.playlist_items,
+            playlist_id,
+            fields="items(track(id,name,artists(id,name)),added_at)",
+            limit=limit,
+            offset=offset
+        )
+        if not res or "items" not in res or not res["items"]:
+            break
 
-    if not existing_tracks or "items" not in existing_tracks:
-        print(f"[WARN] Could not fetch existing tracks for playlist {playlist_id}")
+        items = res["items"]
+        for item in items:
+            track = item.get("track")
+            added_at_str = item.get("added_at")
+            if not track or not added_at_str:
+                continue
+            # robust parse: handle "YYYY-MM-DDTHH:MM:SSZ" and fractional seconds
+            ts = None
+            try:
+                s = added_at_str
+                if s.endswith("Z"):
+                    s = s[:-1]
+                # try ISO parse (handles fractional seconds)
+                ts = datetime.fromisoformat(s).replace(tzinfo=timezone.utc)
+            except Exception:
+                try:
+                    ts = datetime.strptime(added_at_str, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+                except Exception:
+                    # fallback: skip item if we can't parse
+                    print(f"[WARN] Could not parse added_at '{added_at_str}' for track {track.get('id')}, skipping")
+                    continue
+
+            age_days = (now - ts).days
+            if age_days >= days_old:
+                tid = track.get("id")
+                if tid:
+                    uri = f"spotify:track:{tid}"
+                    uris_to_remove.append(uri)
+
+        # paging advance
+        if len(items) < limit:
+            break
+        offset += limit
+
+    if not uris_to_remove:
+        print(f"[INFO] No tracks older than {days_old} days found in playlist {playlist_id}")
         return 0
 
-    now = datetime.now(timezone.utc)
-    tracks_to_remove = []
+    # remove in batches to avoid API limits
+    removed_total = 0
+    batch_size = 50
+    for i in range(0, len(uris_to_remove), batch_size):
+        batch = uris_to_remove[i:i+batch_size]
+        res = safe_spotify_call(sp.playlist_remove_all_occurrences_of_items, playlist_id, batch)
+        if res is None:
+            print(f"[WARN] Removal batch failed for {len(batch)} URIs")
+        else:
+            removed_total += len(batch)
+            print(f"[INFO] Removed batch of {len(batch)} URIs from playlist {playlist_id}")
 
-    for item in existing_tracks["items"]:
-        track = item.get("track")
-        added_at_str = item.get("added_at")
-        if not track or not added_at_str:
-            continue
-        try:
-            added_at = datetime.strptime(added_at_str, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
-        except Exception:
-            continue
-        age_days = (now - added_at).days
-        if age_days >= days_old:
-            track_id = track.get("id")
-            if track_id:
-                tracks_to_remove.append({"uri": f"spotify:track:{track_id}"})
-
-    removed_count = 0
-    if tracks_to_remove:
-        sp.playlist_remove_all_occurrences_of_items(playlist_id, [t["uri"] for t in tracks_to_remove])
-        removed_count = len(tracks_to_remove)
-        print(f"[INFO] Removed {removed_count} track(s) older than {days_old} days")
-    else:
-        print(f"[INFO] No tracks older than {days_old} days found")
-
-    return removed_count
+    print(f"[INFO] Removed {removed_total} track URIs older than {days_old} days from playlist {playlist_id}")
+    return removed_total
 
 # add track_allowed_to_add helper to check DB blacklists before adding a track
 def track_allowed_to_add(track):
