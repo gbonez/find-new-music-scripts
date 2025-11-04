@@ -75,11 +75,23 @@ def get_global_driver():
         chromedriver_path = os.environ.get("CHROMEDRIVER_PATH")
 
         options = webdriver.ChromeOptions()
-        options.binary_location = chrome_bin
+        if chrome_bin:
+            options.binary_location = chrome_bin
         options.add_argument("--headless=new")
         options.add_argument("--disable-gpu")
         options.add_argument("--no-sandbox")
         options.add_argument("--disable-dev-shm-usage")
+
+        # try to use chromedriver-binary if no explicit path provided
+        if not chromedriver_path:
+            try:
+                import chromedriver_binary  # installs and exposes binary_path
+                chromedriver_path = getattr(chromedriver_binary, "binary_path", None)
+            except Exception:
+                chromedriver_path = None
+
+        if not chromedriver_path:
+            raise RuntimeError("CHROMEDRIVER_PATH (or chromedriver-binary) is required to start the Chrome driver")
 
         service = Service(chromedriver_path)
         global_driver = webdriver.Chrome(service=service, options=options)
@@ -358,22 +370,29 @@ def select_track_for_artist(artist_name, artists_data, existing_artist_ids):
         similar_artists = []
     random.shuffle(similar_artists)
     for sim_artist in similar_artists[:10]:
-        artist_results = safe_spotify_call(sp.search, sim_artist, type="artist", limit=1)["artists"]["items"]
-        if not artist_results:
+        # defensive Spotify search result handling
+        search_res = safe_spotify_call(sp.search, sim_artist, type="artist", limit=1)
+        if not search_res or "artists" not in search_res or not search_res["artists"].get("items"):
             continue
+        artist_results = search_res["artists"]["items"]
         sim_artist_data = artist_results[0]
-        if sim_artist_data["followers"]["total"] >= 50000:
+        # follower count may be int or string; coerce safely
+        try:
+            sim_followers = int(sim_artist_data.get("followers", {}).get("total", 0) or 0)
+        except Exception:
+            sim_followers = 0
+        if sim_followers >= 50000:
             continue
         top_tracks_resp = safe_spotify_call(sp.artist_top_tracks, sim_artist_data["id"], country="US")
         top_tracks = top_tracks_resp["tracks"] if top_tracks_resp and "tracks" in top_tracks_resp else []
         if top_tracks:
-            track = random.choice(top_tracks)
-            is_valid, reason = validate_track(track, artists_data, existing_artist_ids, max_followers=50000)
-            if is_valid:
-                print(f"[INFO] Selected valid track '{track['name']}' by '{track['artists'][0]['name']}' from Last.fm similar artists")
-                return track
-            else:
-                print(f"[VALIDATION] Track '{track['name']}' by '{track['artists'][0]['name']}' failed: {reason}")
+             track = random.choice(top_tracks)
+             is_valid, reason = validate_track(track, artists_data, existing_artist_ids, max_followers=50000)
+             if is_valid:
+                 print(f"[INFO] Selected valid track '{track['name']}' by '{track['artists'][0]['name']}' from Last.fm similar artists")
+                 return track
+             else:
+                 print(f"[VALIDATION] Track '{track['name']}' by '{track['artists'][0]['name']}' failed: {reason}")
 
 
     # Step 4: Spotify similar artists
@@ -386,7 +405,13 @@ def select_track_for_artist(artist_name, artists_data, existing_artist_ids):
     artists_list = similar_artists_data["artists"]
     random.shuffle(artists_list)
     for sim_artist_data in artists_list[:10]:
-        if sim_artist_data["followers"]["total"] >= 50000 or sim_artist_data["name"].lower() == artist_name.lower():
+        # defensive follower/name handling
+        try:
+            sim_followers = int(sim_artist_data.get("followers", {}).get("total", 0) or 0)
+        except Exception:
+            sim_followers = 0
+        sim_name = (sim_artist_data.get("name") or "").lower()
+        if sim_followers >= 50000 or sim_name == artist_name.lower():
             continue
         top_tracks_resp = safe_spotify_call(sp.artist_top_tracks, sim_artist_data["id"], country="US")
         top_tracks = top_tracks_resp["tracks"] if top_tracks_resp and "tracks" in top_tracks_resp else []
@@ -510,7 +535,11 @@ def load_artists_from_db():
             for r in rows:
                 aid = r.get("artist_id")
                 name = r.get("artist_name") or ""
-                total = r.get("total_liked") or 0
+                # coerce total_liked to int to avoid later type errors
+                try:
+                    total = int(r.get("total_liked") or 0)
+                except Exception:
+                    total = 0
                 if aid:
                     artists[aid] = {"name": name, "total_liked": total}
             return artists
@@ -624,7 +653,10 @@ def calculate_weights(all_artists, artist_play_map):
     max_recent_60 = 0
 
     for aid, info in all_artists.items():
-        artist_name_lower = info["name"].lower()
+        artist_name_lower = (info.get("name") or "").lower()
+        if not artist_name_lower:
+            continue
+
         scrobbles = artist_play_map.get(artist_name_lower, [])
         if not scrobbles:
             continue
@@ -777,13 +809,23 @@ if __name__ == "__main__":
 
     # Merge DB-cache with newly discovered artists (new_artists may include names/total_liked increments)
     all_artists = {**artists_data}
+
+    def _to_int(v):
+        try:
+            return int(v)
+        except Exception:
+            return 0
+
     for aid, info in new_artists.items():
+        new_total = _to_int(info.get("total_liked", 0))
+        new_name = info.get("name") or ""
         if aid in all_artists:
-            all_artists[aid]["total_liked"] = max(all_artists[aid].get("total_liked", 0), info.get("total_liked", 0))
+            existing_total = _to_int(all_artists[aid].get("total_liked", 0))
+            all_artists[aid]["total_liked"] = max(existing_total, new_total)
             if not all_artists[aid].get("name"):
-                all_artists[aid]["name"] = info.get("name")
+                all_artists[aid]["name"] = new_name
         else:
-            all_artists[aid] = info
+            all_artists[aid] = {"name": new_name, "total_liked": new_total}
 
     recent_tracks = fetch_all_recent_tracks()
     artist_play_map = build_artist_play_map(recent_tracks)
