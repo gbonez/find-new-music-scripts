@@ -304,9 +304,14 @@ def select_track_for_artist(artist_name, artists_data, existing_artist_ids):
         if not search_res or "playlists" not in search_res or not search_res["playlists"].get("items"):
             break
         for pl in search_res["playlists"]["items"]:
+            if not pl or not isinstance(pl, dict):
+                print(f"[WARN] Skipping malformed playlist entry: {pl}")
+                continue
+
             pid = pl.get("id")
             if not pid or pid in seen_candidate_ids:
                 continue
+
             seen_candidate_ids.add(pid)
             candidate_playlists.append(pl)
         # small pause to be polite / avoid hitting rate-limits on many pages
