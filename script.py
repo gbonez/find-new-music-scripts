@@ -537,6 +537,17 @@ def validate_track(track, artists_data, existing_artist_ids=None, max_followers=
     aid = artist.get("id")
     name_lower = (artist.get("name") or "").lower()
 
+    # DB-level blacklist checks: immediate ineligibility if track or artist appears in blacklisted_songs
+    try:
+        tid = track.get("id")
+        if tid and is_track_blacklisted(tid):
+            return False, "Track is blacklisted in DB"
+        if aid and blacklisted_artist_count(aid) and blacklisted_artist_count(aid) > 0:
+            return False, f"Artist '{artist.get('name')}' appears in blacklisted_songs"
+    except Exception as e:
+        # log and continue with other checks (avoid blocking on DB failures)
+        print(f"[WARN] validate_track DB blacklist check failed: {e}")
+
     # 1. Blocked by artists.json
     artist_entry = artists_data.get(aid)
     if not artist_entry:
@@ -924,9 +935,9 @@ def fetch_all_playlist_items(playlist_id, page_limit=100):
 
 # ...existing code...
 
-def add_track_to_blacklist_db(track):
+def add_track_to_blacklist_db(track, fixed=False):
     """
-    Insert a track into blacklisted_songs with fixed = false.
+    Insert a track into blacklisted_songs with fixed flag.
     Attempts insertion with created_at column if present, otherwise falls back.
     """
     if not track or not isinstance(track, dict):
@@ -949,10 +960,10 @@ def add_track_to_blacklist_db(track):
                 cur.execute(
                     """
                     INSERT INTO blacklisted_songs (song_id, song_name, artist_id, artist_name, fixed, created_at)
-                    VALUES (%s, %s, %s, %s, false, NOW())
+                    VALUES (%s, %s, %s, %s, %s, NOW())
                     ON CONFLICT (song_id) DO NOTHING
                     """,
-                    (tid, song_name, artist_id, artist_name),
+                    (tid, song_name, artist_id, artist_name, fixed),
                 )
             except Exception:
                 # fallback if created_at doesn't exist
@@ -960,10 +971,10 @@ def add_track_to_blacklist_db(track):
                     cur.execute(
                         """
                         INSERT INTO blacklisted_songs (song_id, song_name, artist_id, artist_name, fixed)
-                        VALUES (%s, %s, %s, %s, false)
+                        VALUES (%s, %s, %s, %s, %s)
                         ON CONFLICT (song_id) DO NOTHING
                         """,
-                        (tid, song_name, artist_id, artist_name),
+                        (tid, song_name, artist_id, artist_name, fixed),
                     )
                 except Exception as e2:
                     print(f"[DB] Failed to insert blacklisted song (fallback): {e2}")
@@ -1109,8 +1120,24 @@ def _artist_key_from_track(t):
 if __name__ == "__main__":
     print("Starting Enhanced Recs Script...")
     time.sleep(1)
-    # Update artists cache (scan user's liked songs for new artists)
-    new_artists, _ = update_artists_from_likes()
+
+    new_artists, liked_songs = update_artists_from_likes()
+
+    # Persist detected liked songs into blacklisted_songs with fixed = true so they are excluded
+    try:
+        inserted = 0
+        for ls in liked_songs:
+            tid = ls.get("track_id")
+            if not tid:
+                continue
+            # build minimal track dict to reuse insertion helper
+            track_stub = {"id": tid, "name": ls.get("track") or "", "artists": ls.get("artists") or []}
+            add_track_to_blacklist_db(track_stub, fixed=True)
+            inserted += 1
+        if inserted:
+            print(f"[DB] Inserted {inserted} liked songs into blacklisted_songs with fixed=true")
+    except Exception as e:
+        print(f"[WARN] Failed to insert liked songs into blacklist DB: {e}")
 
     # Load canonical artist cache from DB (fallback to file if DB absent)
     artists_data = load_artists_from_db()
